@@ -1,0 +1,108 @@
+CREATE OR REPLACE PROCEDURE  BEATROUTE_UAT_STAGE.BEATROUTE_MYSQL.USER_CDC_SP()
+RETURNS STRING
+LANGUAGE SQL
+AS
+$$
+DECLARE
+    STAGING_TABLE STRING DEFAULT 'USER';
+    TARGET_TABLE STRING DEFAULT 'USER_TRG';
+    SQL_STATEMENT STRING;
+    COLUMN_NAME STRING;
+    DATA_TYPE STRING;
+    QUERY STRING;
+    RESULT RESULTSET;
+BEGIN
+    -- Step 1: Dynamically construct the query to find columns that exist in the staging table but not in the target table
+    QUERY := '
+        SELECT COLUMN_NAME, DATA_TYPE
+        FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_NAME = ''' || STAGING_TABLE || '''
+        AND COLUMN_NAME NOT IN (
+            SELECT COLUMN_NAME
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_NAME = ''' || TARGET_TABLE || '''
+        )';
+    RESULT := (EXECUTE IMMEDIATE :QUERY);
+
+    -- Step 2: Loop through the result set and alter the target table
+    FOR REC IN RESULT DO
+        COLUMN_NAME := REC.COLUMN_NAME;
+        DATA_TYPE := REC.DATA_TYPE;
+        -- Step 3: Construct and execute the ALTER TABLE query
+        SQL_STATEMENT := 'ALTER TABLE ' || TARGET_TABLE || ' ADD COLUMN "' || COLUMN_NAME || '" ' || DATA_TYPE || ';';
+        EXECUTE IMMEDIATE SQL_STATEMENT;
+    END FOR;
+
+    -- Step 3: Create the MERGE statement (original logic unchanged)
+    sql_statement := (
+        WITH primary_keys AS (
+            SELECT ARRAY_CONSTRUCT('"ID"') AS pk_array
+        ),
+        column_info AS (
+            SELECT DISTINCT ('"' || COLUMN_NAME || '"') AS COLUMN_NAME
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_NAME = :STAGING_TABLE
+        ),
+        update_clause AS (
+            SELECT LISTAGG('TARGET.' || COLUMN_NAME || ' = STAGED.' || COLUMN_NAME, ', ') AS update_columns
+            FROM column_info
+        ),
+        insert_columns AS (
+            SELECT DISTINCT LISTAGG(COLUMN_NAME, ', ') AS column_names
+            FROM column_info
+        ),
+        insert_values AS (
+            SELECT LISTAGG('STAGED.' || COLUMN_NAME, ', ') AS value_names
+            FROM column_info
+        ),
+        join_condition AS (
+            SELECT LISTAGG('TARGET.' || key.value || ' = STAGED.' || key.value, ' AND ') AS condition
+            FROM primary_keys, TABLE(FLATTEN(INPUT => pk_array)) key
+        ),
+        partition_keys AS (
+            SELECT LISTAGG(key.value, ', ') AS keys
+            FROM primary_keys, TABLE(FLATTEN(INPUT => pk_array)) key
+        ),
+        column_names_clause AS (
+            SELECT column_names FROM insert_columns
+        ),
+        value_names_clause AS (
+            SELECT value_names FROM insert_values
+        ),
+        update_set_clause AS (
+            SELECT update_columns FROM update_clause
+        ),
+        join_condition_clause AS (
+            SELECT condition FROM join_condition
+        ),
+        partition_keys_clause AS (
+            SELECT keys FROM partition_keys
+        ),
+        merge_sql AS (
+            SELECT 
+                'MERGE INTO ' || :target_table || ' AS TARGET USING (
+                    SELECT DISTINCT ' || column_names_clause.column_names || ', 
+                           ROW_NUMBER() OVER (PARTITION BY ' || partition_keys_clause.keys || ' ORDER BY timestamp DESC) AS rn 
+                    FROM ' || :STAGING_TABLE || ' 
+                     QUALIFY rn = 1
+                 ) AS STAGED 
+                 ON ' || join_condition_clause.condition || '
+                 WHEN MATCHED AND STAGED."Op" = ''D'' AND STAGED.rn = 1 THEN DELETE 
+                 WHEN MATCHED AND STAGED."Op" = ''U'' AND STAGED.rn = 1 THEN UPDATE SET ' || 
+                 update_set_clause.update_columns || ' 
+                 WHEN NOT MATCHED AND STAGED.rn = 1 THEN INSERT (' || 
+                 column_names_clause.column_names || ') 
+                 VALUES (' || column_names_clause.column_names || ');' AS sql_statement
+            FROM column_names_clause, value_names_clause, update_set_clause, join_condition_clause, partition_keys_clause
+        )
+        SELECT sql_statement FROM merge_sql
+    );
+
+
+    -- Execute the generated SQL statement
+    -- EXECUTE IMMEDIATE :SQL_STATEMENT;
+    RETURN :SQL_STATEMENT;
+
+    RETURN 'Altering columns has been handled and Merge operation executed successfully';
+END;
+$$;
